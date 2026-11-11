@@ -11,6 +11,7 @@
     "sessionserver.mojang.com": "profiles and joins",
     "pc.realms.minecraft.net": "Realms",
     "java.frontend.realms.minecraft-services.net": "Realms",
+    "java.frontendlegacy.realms.minecraft-services.net": "Realms, while its feature flags say realms_in_aks",
     "piston-meta.mojang.com": "version manifests",
     "launchermeta.mojang.com": "version manifests (older address)",
     "resources.download.minecraft.net": "vanilla's assets",

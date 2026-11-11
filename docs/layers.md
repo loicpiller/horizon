@@ -602,7 +602,7 @@ Vanilla's endpoints (engine, the same as Java Edition):
 |---|---|---|
 | `discovery.minecraftservices.com`, `api.minecraftservices.com` | services discovery, profile keys, player certificates | `auth.rs`, `horizon-server-files/src/profiles.rs` |
 | `textures.minecraft.net` | skins and capes | `skins.rs` |
-| `pc.realms.minecraft.net`, `java.frontend.realms.minecraft-services.net` | Realms | `realms/client.rs` |
+| `pc.realms.minecraft.net`, `java.frontendlegacy.realms.minecraft-services.net` (while the service's feature flags say `realms_in_aks`), `java.frontend.realms.minecraft-services.net` | Realms | `realms/client.rs` |
 | `aka.ms/…` | vanilla's help links (accessibility, moderation, EULA, Realms terms), opened only on a click | `game/options.rs`, `game/screens.rs`, `ban_notice.rs`, `realms.rs`, `eula.rs` |
 | `libraries.minecraft.net`, `piston-meta.mojang.com`, `resources.download.minecraft.net` | the vanilla jars, libraries and assets | `horizon-prepare`, launcher |
 

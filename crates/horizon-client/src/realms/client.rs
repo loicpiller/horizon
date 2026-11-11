@@ -6,12 +6,18 @@
 //! put in an error and never sent anywhere else.
 use horizon_core::version;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 /// `RealmsClient.Environment.PRODUCTION`'s base URL.
 pub const DEFAULT_REALMS_HOST: &str = "https://pc.realms.minecraft.net";
+/// `RealmsClient.Environment.PRODUCTION`'s `alternativeUrl`: the base URL's stand-in while the
+/// service's feature flags hold [`REALMS_IN_AKS`].
+pub const DEFAULT_REALMS_ALTERNATIVE_HOST: &str =
+    "https://java.frontendlegacy.realms.minecraft-services.net";
 /// `RealmsClient.Environment.PRODUCTION`'s `frontendV2Url` (invite codes).
 pub const DEFAULT_FRONTEND_V2_HOST: &str = "https://java.frontend.realms.minecraft-services.net";
 
@@ -21,6 +27,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// `RealmsClient.join`: `Request.get(url, 5000, 30000)`.
 const JOIN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// `RealmsClient.fetchFeatureFlags`: `Request.get(url, 5000, 10000)`.
+const FLAGS_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// The feature flag that moves every request built by `RealmsClient.url` to the alternative host.
+const REALMS_IN_AKS: &str = "realms_in_aks";
+
+/// `RealmsClient.featureFlags`, the future `url` joins: one per service and account, for the
+/// process. Vanilla asks once, for the one `RealmsClient` the game makes for its one account.
+/// Horizon makes a client for each use and its session can change, so the answer is kept here,
+/// keyed as `availability`'s check is (the account's UUID and access token): the service is
+/// asked with that account's cookies, so its flags are that account's, and a new session asks
+/// again. The base URL is in the key too, so a client of another service never shares them. A
+/// request that failed leaves an empty set for good, as vanilla's future does.
+type FlagsKey = (String, u128, String);
+static FEATURE_FLAGS: LazyLock<Mutex<HashMap<FlagsKey, Arc<OnceLock<HashSet<String>>>>>> =
+    LazyLock::new(Default::default);
 
 /// Vanilla sets no user agent: `HttpURLConnection` sends the JVM's own, `Java/<version>`.
 fn user_agent() -> String {
@@ -1142,6 +1163,9 @@ pub enum CompatibleVersion {
 #[derive(Clone)]
 pub struct RealmsClient {
     base_url: String,
+    /// The alternative host, asked for the feature flags first; `None` (a client made with
+    /// [`RealmsClient::new`]) keeps every request on `base_url` and asks nothing.
+    alternative_url: Option<String>,
     frontend_url: String,
     player_name: String,
     player_uuid: u128,
@@ -1166,15 +1190,19 @@ impl RealmsClient {
     ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
+            alternative_url: None,
             frontend_url: frontend_url.trim_end_matches('/').to_owned(),
             player_name: session.name.clone(),
             player_uuid: session.uuid,
             access_token: session.access_token().to_owned(),
         }
     }
-    /// The production service.
+    /// The production service, with its alternative host.
     pub fn production(session: &horizon_client_render::auth::AuthSession) -> Self {
-        Self::new(DEFAULT_REALMS_HOST, DEFAULT_FRONTEND_V2_HOST, session)
+        Self {
+            alternative_url: Some(DEFAULT_REALMS_ALTERNATIVE_HOST.to_owned()),
+            ..Self::new(DEFAULT_REALMS_HOST, DEFAULT_FRONTEND_V2_HOST, session)
+        }
     }
 
     /// `RealmsClient.execute`'s cookies (`User.getSessionId`, `getName`,
@@ -1254,8 +1282,51 @@ impl RealmsClient {
         Err(RealmsError::from_answer(status, &text, html))
     }
 
+    /// `RealmsClient.url`: the base URL, or the alternative host while the feature flags hold
+    /// [`REALMS_IN_AKS`]. Asking the flags blocks: every request runs on a worker thread.
     fn url(&self, path: &str) -> String {
-        format!("{}/{path}", self.base_url)
+        let host = match &self.alternative_url {
+            Some(alternative) if self.has_feature_flag(REALMS_IN_AKS) => alternative,
+            _ => &self.base_url,
+        };
+        format!("{host}/{path}")
+    }
+
+    /// `RealmsClient.getFeatureFlags`: the first caller for this service and account asks, on
+    /// its own thread; any other caller waits for that answer (`CompletableFuture.join`).
+    fn has_feature_flag(&self, flag: &str) -> bool {
+        let key = (
+            self.base_url.clone(),
+            self.player_uuid,
+            self.access_token.clone(),
+        );
+        // The lock covers the lookup only: the request runs outside it.
+        let flags = Arc::clone(
+            FEATURE_FLAGS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key)
+                .or_default(),
+        );
+        flags
+            .get_or_init(|| self.fetch_feature_flags())
+            .contains(flag)
+    }
+
+    /// `RealmsClient.fetchFeatureFlags`: `GET feature/v1` on the base URL whatever the flags,
+    /// with every request's cookies and headers; an empty set when it fails or doesn't parse.
+    fn fetch_feature_flags(&self) -> HashSet<String> {
+        let url = format!("{}/feature/v1", self.base_url);
+        match Self::execute(self.request("GET", &url, FLAGS_READ_TIMEOUT), None) {
+            Ok(json) => parse_feature_flags(&json).unwrap_or_else(|| {
+                log::error!("Could not parse Realms feature flags");
+                HashSet::new()
+            }),
+            Err(error) => {
+                log::error!("Failed to fetch Realms feature flags: {error:?}");
+                HashSet::new()
+            }
+        }
     }
 
     /// `RealmsClient.listRealms` (a release client: no `listUserWorldsOfType`).
@@ -1902,6 +1973,19 @@ fn undashed(uuid: &str) -> Result<String, RealmsError> {
     }
 }
 
+/// `fetchFeatureFlags`' reading: a JSON array whose every element reads as a string
+/// (`JsonElement.getAsString`: a string, a number or a boolean), else nothing.
+fn parse_feature_flags(json: &str) -> Option<HashSet<String>> {
+    let values: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let flag = |value| match value {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(boolean) => Some(boolean.to_string()),
+        _ => None,
+    };
+    values.into_iter().map(flag).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,41 +1999,89 @@ mod tests {
     fn serve_once(answer: &'static str) -> (String, std::thread::JoinHandle<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        (
+            base,
+            std::thread::spawn(move || exchange(&listener, answer, "the only exchange")),
+        )
+    }
+
+    /// One exchange per answer, in order, then the port closes: the requests as read.
+    fn serve(answers: Vec<&'static str>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut seen = Vec::new();
-            let mut buf = [0u8; 4096];
-            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
-                }
-                seen.extend_from_slice(&buf[..n]);
-            }
-            // The body the headers announce, which may come in a later read.
-            let head = seen
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map_or(seen.len(), |i| i + 4);
-            let length = String::from_utf8_lossy(&seen[..head])
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length")
-                        .then(|| v.trim().parse().ok())?
-                })
-                .unwrap_or(0usize);
-            while seen.len() < head + length {
-                let n = stream.read(&mut buf).unwrap();
-                if n == 0 {
-                    break;
-                }
-                seen.extend_from_slice(&buf[..n]);
-            }
-            stream.write_all(answer.as_bytes()).unwrap();
-            String::from_utf8_lossy(&seen).into_owned()
+            let expected = answers.len();
+            answers
+                .iter()
+                .enumerate()
+                .map(|(i, a)| exchange(&listener, a, &format!("exchange {} of {expected}", i + 1)))
+                .collect::<Vec<_>>()
         });
         (base, handle)
+    }
+
+    /// How long a test server waits for a connection, and for the bytes of a request.
+    const SERVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Accepts one connection within [`SERVER_DEADLINE`], else panics saying which `what` never
+    /// came, so the test that joins the server fails instead of hanging. The stream is blocking,
+    /// with a read timeout.
+    fn accept_within(listener: &std::net::TcpListener, what: &str) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + SERVER_DEADLINE;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "test server: no request came within {SERVER_DEADLINE:?} for {what}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("test server: accept failed for {what}: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(SERVER_DEADLINE)).unwrap();
+        stream
+    }
+
+    /// Accepts one connection, reads the request (head and announced body), answers.
+    /// `what` names the exchange in the failure if it never comes.
+    fn exchange(listener: &std::net::TcpListener, answer: &str, what: &str) -> String {
+        let mut stream = accept_within(listener, what);
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+        // The body the headers announce, which may come in a later read.
+        let head = seen
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(seen.len(), |i| i + 4);
+        let length = String::from_utf8_lossy(&seen[..head])
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse().ok())?
+            })
+            .unwrap_or(0usize);
+        while seen.len() < head + length {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+        stream.write_all(answer.as_bytes()).unwrap();
+        String::from_utf8_lossy(&seen).into_owned()
     }
 
     fn client(base: &str) -> RealmsClient {
@@ -2469,7 +2601,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_within(&listener, "the request");
             let mut seen = Vec::new();
             let mut buf = [0u8; 4096];
             loop {
@@ -2710,5 +2842,146 @@ mod tests {
         let error = client(&base).has_parental_consent().unwrap_err();
         server.join().unwrap();
         assert_eq!(error.code(), 401);
+    }
+
+    /// An HTTP answer with `body`, for [`serve`].
+    fn answer(status: &str, body: &str) -> &'static str {
+        let text = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        Box::leak(text.into_boxed_str())
+    }
+
+    /// A port nothing listens on: a request there gets no answer.
+    fn closed_port() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    }
+
+    /// [`RealmsClient::production`]'s shape on local hosts: base and frontend `base`.
+    fn with_alternative(base: &str, alternative: &str, session: &AuthSession) -> RealmsClient {
+        RealmsClient {
+            alternative_url: Some(alternative.to_owned()),
+            ..RealmsClient::new(base, base, session)
+        }
+    }
+
+    fn steve() -> AuthSession {
+        AuthSession::new("Steve", UUID, TOKEN)
+    }
+
+    #[test]
+    fn the_feature_flags_are_asked_on_the_base_url_with_every_requests_cookies() {
+        let (base, server) = serve_once(answer("200 OK", r#"["other_flag","realms_in_aks"]"#));
+        let flags = client(&base).fetch_feature_flags();
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /feature/v1 HTTP/1.1"), "{request}");
+        assert_eq!(
+            header(&request, "Cookie"),
+            Some(
+                "sid=token:eyJsecret.token.value:0123456789abcdef0123456789abcdef;user=Steve;version=26.3"
+            )
+        );
+        assert_eq!(header(&request, "Client-Ref"), Some("26.3"));
+        assert_eq!(header(&request, "X-NetworkProtocolVersion"), Some("777"));
+        assert_eq!(header(&request, "Is-Prerelease"), Some("false"));
+        let expected: HashSet<String> = ["other_flag".into(), "realms_in_aks".into()].into();
+        assert_eq!(flags, expected);
+    }
+
+    /// `LenientJsonParser.parse(..).getAsJsonArray()`, each element `getAsString`.
+    #[test]
+    fn the_feature_flags_are_a_json_array_of_strings() {
+        let set = |flags: &[&str]| Some(flags.iter().map(|f| f.to_string()).collect());
+        assert_eq!(parse_feature_flags("[]"), set(&[]));
+        assert_eq!(parse_feature_flags(r#"["a","b","a"]"#), set(&["a", "b"]));
+        assert_eq!(parse_feature_flags("[1, true]"), set(&["1", "true"]));
+        for refused in [
+            "",
+            "not json",
+            "[null]",
+            r#"["a", {}]"#,
+            r#"{"realms_in_aks":1}"#,
+        ] {
+            assert_eq!(parse_feature_flags(refused), None, "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_flag_request_that_fails_gives_no_flags() {
+        for status in ["500 Internal Server Error", "503 Service Unavailable"] {
+            let (base, server) = serve_once(answer(status, r#"["realms_in_aks"]"#));
+            assert_eq!(
+                client(&base).fetch_feature_flags(),
+                HashSet::new(),
+                "{status}"
+            );
+            server.join().unwrap();
+        }
+        let (base, server) = serve_once(answer("200 OK", "realms_in_aks"));
+        assert_eq!(client(&base).fetch_feature_flags(), HashSet::new());
+        server.join().unwrap();
+        assert_eq!(client(&closed_port()).fetch_feature_flags(), HashSet::new());
+    }
+
+    /// The flags are asked once per account for the process, whatever client asks: a second
+    /// flag request would find the base URL closed, get no flags and send `trial` there.
+    #[test]
+    fn with_realms_in_aks_standard_requests_go_to_the_alternative_host() {
+        let (base, flags) = serve(vec![
+            answer("200 OK", r#"["realms_in_aks"]"#),
+            answer("200 OK", r#"["other_flag"]"#),
+            answer("200 OK", "false"),
+        ]);
+        let (alternative, moved) = serve(vec![answer("200 OK", "true"), answer("200 OK", "true")]);
+        for _ in 0..2 {
+            let client = with_alternative(&base, &alternative, &steve());
+            assert_eq!(client.trial_available(), Ok(true));
+        }
+        let moved = moved.join().unwrap();
+        assert!(
+            moved.iter().all(|r| r.starts_with("GET /trial HTTP/1.1")),
+            "{moved:?}"
+        );
+        // Another account asks for its own flags, and without the flag stays on the base URL.
+        let alex = AuthSession::new("Alex", 7, "another.token");
+        let client = with_alternative(&base, &closed_port(), &alex);
+        assert_eq!(client.trial_available(), Ok(false));
+        let lines: Vec<_> = flags
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| r.lines().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "GET /feature/v1 HTTP/1.1",
+                "GET /feature/v1 HTTP/1.1",
+                "GET /trial HTTP/1.1"
+            ]
+        );
+    }
+
+    /// `frontendV2Url` never reads the flags: no flag request, and its own host.
+    #[test]
+    fn frontend_calls_neither_ask_the_flags_nor_change_host() {
+        let base = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", base.local_addr().unwrap());
+        let (frontend, server) = serve_once(answer("200 OK", ""));
+        let client = RealmsClient {
+            alternative_url: Some(closed_port()),
+            ..RealmsClient::new(&base_url, &frontend, &steve())
+        };
+        assert_eq!(client.redeem_invite_code("ABC"), Ok(()));
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("POST /api/v1.0/invite/codes/use/ABC HTTP/1.1"),
+            "{request}"
+        );
+        base.set_nonblocking(true).unwrap();
+        let asked = base.accept().map(drop);
+        assert_eq!(asked.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 }
