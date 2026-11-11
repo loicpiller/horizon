@@ -11,6 +11,7 @@
 pub mod availability;
 pub mod client;
 pub mod download;
+mod unavailable;
 pub mod upload;
 
 use crate::hud::{HudAtlas, HudBatch, rgba};
@@ -850,6 +851,8 @@ pub enum LayoutState {
 pub enum FetchState {
     /// No Microsoft session: nothing is asked of the service.
     Unauthenticated,
+    /// `RealmsAvailability.get()` hasn't said yes: the list is LOADING, nothing is asked.
+    Checking(availability::Pending),
     Loading(Job<Result<Vec<RealmServer>, RealmsError>>),
     Loaded(Vec<RealmServer>),
     Error(RealmsError),
@@ -1313,6 +1316,8 @@ pub enum SubScreen {
         detail: String,
         next: Box<SubScreen>,
     },
+    /// `RealmsAvailability.Result.createErrorScreen`: the check refused this client.
+    Unavailable(unavailable::Unavailable),
 }
 
 /// The join request on its worker, and its abort flag (`LongRunningTask.aborted`).
@@ -1836,7 +1841,7 @@ impl Screen {
 
     pub fn layout_state(&self) -> LayoutState {
         match &self.state {
-            FetchState::Loading(_) => LayoutState::Loading,
+            FetchState::Loading(_) | FetchState::Checking(_) => LayoutState::Loading,
             // A notification entry alone makes the list (`RealmsMainScreen`'s `LIST`).
             FetchState::Loaded(servers)
                 if !servers.is_empty() || !self.notifications.is_empty() =>
@@ -2041,6 +2046,9 @@ impl Screen {
     /// `RealmsMainScreen.refreshServerList`.
     pub fn refresh(&mut self) {
         self.selected = None;
+        if self.hold_for_availability() {
+            return;
+        }
         let now = Instant::now();
         self.last_list_refresh = now;
         self.last_pending_refresh = now;
@@ -2081,17 +2089,6 @@ impl Screen {
         }
     }
 
-    /// `LongRunningTask.error`: a task's failure replaces the screen with
-    /// `RealmsGenericErrorScreen(new Component(message), nextScreen)` — the generic title
-    /// and the message as its detail; OK returns to the list.
-    fn show_generic_error(&mut self, detail: String) {
-        self.subscreen = SubScreen::Error {
-            title: crate::lang::get("mco.errorMessage.generic"),
-            detail,
-            next: Box::new(SubScreen::Main),
-        };
-    }
-
     /// `RealmsMainScreen.openRealmsPdp`: the product page, and its `trialAvailable` check.
     fn open_pdp(&mut self) {
         let trial_job = client().map(|client| spawn(move || client.trial_available()));
@@ -2108,7 +2105,7 @@ impl Screen {
     pub fn poll(&mut self) -> Outcome {
         // `RealmsDataFetcher`'s `DataFetcher.Subscription.tick`: the main list polls its
         // tasks on their own periods while it is the screen showing.
-        if matches!(self.subscreen, SubScreen::Main) {
+        if matches!(self.subscreen, SubScreen::Main) && self.poll_availability() {
             let now = Instant::now();
             if !matches!(self.state, FetchState::Loading(_))
                 && now.duration_since(self.last_list_refresh) >= Duration::from_secs(60)
@@ -3443,7 +3440,7 @@ impl Screen {
             CancelTask(RealmServer),
         }
         let action = match &self.subscreen {
-            SubScreen::Main => Escape::Title,
+            SubScreen::Main | SubScreen::Unavailable(_) => Escape::Title,
             SubScreen::ResetWorld { server, reset, .. } => {
                 if let Some(task) = reset {
                     task.abort.store(true, Ordering::Relaxed);
@@ -4686,6 +4683,7 @@ impl Screen {
         match hit {
             Some(1) => self.play_selected(),
             Some(2) => Outcome::Back,
+            Some(unavailable::PRIVACY_INFO) => self.privacy_info(),
             Some(10) => {
                 if let Some(server) = self.selected_server().cloned() {
                     self.subscreen = SubScreen::Configure {
@@ -7681,6 +7679,7 @@ impl Screen {
                 // `RealmsGenericErrorScreen.init`: OK, 200 wide at h - 52.
                 buttons.push((cx - 100.0, h - 52.0, 200.0, t("gui.ok"), true, 91, None));
             }
+            SubScreen::Unavailable(screen) => screen.buttons(&mut buttons, w, h),
             SubScreen::Terms { .. } => {
                 // `RealmsTermsScreen.init`: (width / 4 - 2)-wide Agree and Disagree at
                 // (width / 4, row(12)) and (width / 2 + 4, row(12)).
@@ -7854,7 +7853,7 @@ impl Screen {
                     12.0,
                     self.join_width.get().max(40.0),
                     t("mco.selectServer.joinRealm"),
-                    signed_in,
+                    signed_in && self.layout_state() != LayoutState::Loading,
                     14,
                     None,
                 ));
@@ -7942,8 +7941,8 @@ impl Screen {
                     LayoutState::NoRealms | LayoutState::Loading => {
                         // `updateButtonStates`: Add Realm and Join Realm are off while
                         // the list is still LOADING (a failed fetch keeps it loading).
-                        let add_enabled =
-                            !matches!(self.state, FetchState::Loading(_) | FetchState::Error(_));
+                        let add_enabled = self.layout_state() != LayoutState::Loading
+                            && !matches!(self.state, FetchState::Error(_));
                         if matches!(self.state, FetchState::Error(_)) {
                             buttons.push((
                                 cx - 154.0,
@@ -10376,13 +10375,9 @@ impl Screen {
                 centered(batch, atlas, loading_dots(), cx, top + 61.0, 0xFF80_8080);
             }
             SubScreen::Error { title, detail, .. } => {
-                // `RealmsGenericErrorScreen`: the title at 80, the detail from 100 in the
-                // -2142128 red, wrapped at 3/4 of the screen, 9 apart.
-                centered(batch, atlas, title, cx, 80.0, u32::MAX);
-                for (i, line) in wrap_lines(detail, atlas, w * 3.0 / 4.0).iter().enumerate() {
-                    centered(batch, atlas, line, cx, 100.0 + i as f32 * 9.0, 0xFF50_50DF);
-                }
+                unavailable::draw_generic_error(batch, atlas, w, title, detail)
             }
+            SubScreen::Unavailable(screen) => screen.draw(batch, atlas, w, h),
             SubScreen::Terms { .. } => {
                 // `RealmsTermsScreen.extractRenderState`: the title at 17, the page's
                 // first sentence at (width/2 - 120, row(5)), the underlined link after it.
@@ -11251,7 +11246,7 @@ impl Screen {
             FetchState::Unauthenticated => {
                 paragraph(batch, &t("horizon.realms.not_signed_in"), GREY)
             }
-            FetchState::Loading(_) => {
+            FetchState::Loading(_) | FetchState::Checking(_) => {
                 // `layout.addToContents(new LoadingDotsWidget(...))`: the widget is 28 tall
                 // (2 + 9 + 6 + 9 + 2) and sits at the contents' top — `header + 30`, or the
                 // space above the footer when the window is shorter. The message is white

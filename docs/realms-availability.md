@@ -112,3 +112,5 @@ from a test, since they use `RealmsClient::production`.
 
 - `crates/horizon-client/src/realms/availability.rs`: `Availability`, `Pending`, `AvailabilityService`, `check`, `AvailabilityCache`, `get`, `current`.
 - `crates/horizon-client/src/realms/client.rs`: `RealmsClient` (the two requests), `CompatibleVersion`, `RealmsError` (`code()`, `message()`, `text()`).
+- `crates/horizon-client/src/realms/unavailable.rs`: the Realms screen as a consumer: it holds its data requests until the answer
+  (`hold_for_availability`, `poll_availability`) and shows the refusal screens. Without a session it keeps its signed-out message.
